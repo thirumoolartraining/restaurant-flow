@@ -10,6 +10,10 @@ const chatbotImagesService = require('../services/chatbotImages');
 const authMiddleware = require('../middleware/auth');
 const { publicRateLimiter, webhookRateLimiter } = require('../middleware/rateLimiter');
 const logger = require('../services/logger');
+const {
+  getPaymentWebhookIdempotencyStore,
+  buildPaymentWebhookIdempotencyKey
+} = require('../services/paymentWebhookIdempotencyStore');
 const router = express.Router();
 
 // Create Razorpay order for UPI intent payment (no auth required - public endpoint)
@@ -203,10 +207,43 @@ router.post('/razorpay-webhook', webhookRateLimiter, express.raw({ type: 'applic
       }
     }
     
-    const event = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-    logger.info('Razorpay webhook event', { event: event.event });
-    
-    const payload = event.payload;
+    const rawBody = Buffer.isBuffer(req.body) ? req.body.toString() : req.body;
+    const event = typeof rawBody === 'string' ? JSON.parse(rawBody) : rawBody;
+    const payload = event.payload || {};
+    const eventType = event.event || 'unknown';
+    const paymentId = payload.payment?.entity?.id
+      || payload.refund?.entity?.payment_id
+      || payload.payment_link?.entity?.id
+      || null;
+    const webhookId = event.id || req.headers['x-razorpay-event-id'] || null;
+    const idempotencyKey = buildPaymentWebhookIdempotencyKey(event);
+    const idempotencyStore = getPaymentWebhookIdempotencyStore();
+
+    const duplicateCheck = await idempotencyStore.checkAndMarkProcessing(idempotencyKey, {
+      webhookId,
+      paymentId,
+      eventType,
+      receivedAt: new Date().toISOString()
+    });
+
+    if (duplicateCheck.isDuplicate) {
+      logger.info('Razorpay webhook duplicate detected', {
+        webhookId,
+        paymentId,
+        eventType,
+        isDuplicate: true,
+        actionTaken: 'skipped_duplicate'
+      });
+      return res.json({ status: 'ok' });
+    }
+
+    logger.info('Razorpay webhook event', {
+      event: eventType,
+      webhookId,
+      paymentId,
+      isDuplicate: false,
+      actionTaken: 'processing'
+    });
     
     // Handle refund events
     if (event.event === 'refund.processed' || event.event === 'refund.created') {
@@ -234,7 +271,9 @@ router.post('/razorpay-webhook', webhookRateLimiter, express.raw({ type: 'applic
       }
       
       // Update order with refund details
-      if (refund.status === 'processed') {
+      if (order.paymentStatus === 'refunded' || order.status === 'refunded') {
+        logger.info('Refund webhook already applied', { webhookId, orderId: order.orderId, paymentId, eventType, isDuplicate: true, actionTaken: 'skip_already_refunded' });
+      } else if (refund.status === 'processed') {
         order.refundStatus = 'completed';
         order.refundId = refund.id;
         order.refundProcessedAt = new Date();
@@ -274,6 +313,7 @@ router.post('/razorpay-webhook', webhookRateLimiter, express.raw({ type: 'applic
         }
       }
       
+      await idempotencyStore.markProcessed(idempotencyKey, { webhookId, paymentId, eventType, orderId: order?.orderId || null, isDuplicate: false, actionTaken: 'refund_event_processed' });
       return res.json({ status: 'ok' });
     }
     
@@ -334,6 +374,7 @@ router.post('/razorpay-webhook', webhookRateLimiter, express.raw({ type: 'applic
         logger.error('WhatsApp notification failed', { error: whatsappErr.message });
       }
       
+      await idempotencyStore.markProcessed(idempotencyKey, { webhookId, paymentId, eventType, orderId: order?.orderId || null, isDuplicate: false, actionTaken: 'refund_failed_processed' });
       return res.json({ status: 'ok' });
     }
     
@@ -344,7 +385,9 @@ router.post('/razorpay-webhook', webhookRateLimiter, express.raw({ type: 'applic
       
       if (paymentLinkId) {
         const order = await Order.findOne({ razorpayOrderId: paymentLinkId });
-        if (order && order.paymentStatus !== 'paid') {
+        if (order && order.paymentStatus === 'paid') {
+          logger.info('Payment captured webhook already applied', { webhookId, orderId: order.orderId, paymentId: payment?.id, eventType, isDuplicate: true, actionTaken: 'skip_already_paid' });
+        } else if (order) {
           order.paymentStatus = 'paid';
           order.razorpayPaymentId = payment.id;
           order.status = 'confirmed';
@@ -386,9 +429,11 @@ router.post('/razorpay-webhook', webhookRateLimiter, express.raw({ type: 'applic
         }
       }
       
+      await idempotencyStore.markProcessed(idempotencyKey, { webhookId, paymentId, eventType, isDuplicate: false, actionTaken: 'payment_captured_processed' });
       return res.json({ status: 'ok' });
     }
     
+    await idempotencyStore.markProcessed(idempotencyKey, { webhookId, paymentId, eventType, actionTaken: 'ignored_event' });
     res.json({ status: 'ok' });
   } catch (error) {
     logger.error('Razorpay webhook error', { error: error.message });

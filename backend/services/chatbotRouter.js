@@ -17,7 +17,7 @@ const chatbot = require('./chatbot');
 const domainRegistry = require('./domains/index');
 const Customer = require('../models/Customer');
 const conversationState = require('./conversationState');
-const { logger } = require('./correlationContext');
+const { logger, getCorrelationId, setMetadata } = require('./correlationContext');
 
 // Intent to domain mapping
 const INTENT_DOMAIN_MAP = {
@@ -86,20 +86,24 @@ const STATE_DOMAIN_MAP = {
  * @returns {Promise<void>}
  */
 async function handleMessage(phone, message, messageType = 'text', selectedId = null, senderName = null) {
+  let targetDomain = null;
+
   try {
     // Get customer and state
     const customer = await Customer.findOne({ phone });
     const state = customer ? conversationState.getState(customer) : null;
     
     // Determine target domain
-    const targetDomain = detectDomain(message, messageType, selectedId, state);
+    targetDomain = detectDomain(message, messageType, selectedId, state);
     
     if (targetDomain && domainRegistry.hasDomain(targetDomain)) {
+      setMetadata('targetDomain', targetDomain);
       logger.info('Routing to domain', {
         phone,
         domain: targetDomain,
         messageType,
-        selectedId
+        selectedId,
+        correlationId: getCorrelationId()
       });
       
       // Route to domain handler
@@ -109,17 +113,34 @@ async function handleMessage(phone, message, messageType = 'text', selectedId = 
     }
     
     // Fallback to legacy chatbot (Phase 3.6 will remove this)
-    return await chatbot.handleMessage(phone, message, messageType, selectedId, senderName);
+    const result = await chatbot.handleMessage(phone, message, messageType, selectedId, senderName);
+    logger.info('Downstream chatbot handler completed', {
+      phone,
+      messageType,
+      selectedId,
+      domain: targetDomain || 'legacy',
+      correlationId: getCorrelationId()
+    });
+    return result;
     
   } catch (error) {
     logger.error('Router error', {
       error: error.message,
       phone,
-      messageType
+      messageType,
+      correlationId: getCorrelationId()
     });
     
     // Fallback to legacy chatbot on error
-    return await chatbot.handleMessage(phone, message, messageType, selectedId, senderName);
+    const result = await chatbot.handleMessage(phone, message, messageType, selectedId, senderName);
+    logger.info('Downstream chatbot handler completed', {
+      phone,
+      messageType,
+      selectedId,
+      domain: targetDomain || 'legacy',
+      correlationId: getCorrelationId()
+    });
+    return result;
   }
 }
 

@@ -36,6 +36,7 @@ const categoryScheduler = require('./services/categoryScheduler');
 const orderCleanup = require('./services/orderCleanup');
 const cartCleanup = require('./services/cartCleanup');
 const googleSheets = require('./services/googleSheets');
+const { startAlertMonitors } = require('./services/alerting/monitors');
 
 // Validate environment variables at startup
 validateEnv(process.env.NODE_ENV === 'production');
@@ -134,6 +135,7 @@ mongoose.connection.on('error', (err) => {
 });
 
 connectMongoDB();
+startAlertMonitors();
 
 app.use('/api/auth', authRoutes);
 app.use('/api/menu', menuRoutes);
