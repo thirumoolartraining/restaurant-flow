@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: restaurant-bot
+data:
+  NODE_ENV: "production"
+  PORT: "5000"
+  REDIS_HOST: "redis-service"
+  REDIS_PORT: "6379"
+  # Add other non-sensitive config here

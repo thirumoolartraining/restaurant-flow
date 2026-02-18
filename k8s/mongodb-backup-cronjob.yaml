@@ -1,0 +1,107 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mongodb-backup
+  namespace: restaurant-bot
+  labels:
+    app: mongodb-backup
+spec:
+  # Run daily at 2:00 AM UTC
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800 # 30 minute timeout
+      template:
+        metadata:
+          labels:
+            app: mongodb-backup
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            fsGroup: 1001
+          containers:
+          - name: backup
+            image: mongo:7.0
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                  - ALL
+            env:
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: MONGODB_URI
+            - name: BACKUP_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: backend-config
+                  key: BACKUP_BUCKET
+                  optional: true
+            command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              BACKUP_DIR="/backups/mongodb-${TIMESTAMP}"
+              
+              echo "Starting MongoDB backup at ${TIMESTAMP}..."
+              
+              # Create backup using mongodump
+              mongodump --uri="${MONGODB_URI}" --out="${BACKUP_DIR}" --gzip
+              
+              echo "Backup created at ${BACKUP_DIR}"
+              
+              # Compress into single archive
+              cd /backups
+              tar -czf "mongodb-${TIMESTAMP}.tar.gz" "mongodb-${TIMESTAMP}"
+              rm -rf "mongodb-${TIMESTAMP}"
+              
+              echo "Backup compressed: mongodb-${TIMESTAMP}.tar.gz"
+              
+              # Remove backups older than 14 days
+              find /backups -name "mongodb-*.tar.gz" -mtime +14 -delete
+              echo "Old backups cleaned up"
+              
+              # List current backups
+              echo "Current backups:"
+              ls -lh /backups/mongodb-*.tar.gz 2>/dev/null || echo "No backups found"
+              
+              echo "Backup completed successfully!"
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi
+            volumeMounts:
+            - name: backup-storage
+              mountPath: /backups
+          volumes:
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: mongodb-backup-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongodb-backup-pvc
+  namespace: restaurant-bot
+  labels:
+    app: mongodb-backup
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "881109986859",
+    "project_id": "restarunt-bot",
+    "storage_bucket": "restarunt-bot.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:881109986859:android:92903b1fd53e0fffa6046e",
+        "android_client_info": {
+          "package_name": "com.foodadmin.mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAwqWqpUWuFWMgt0h-omAqjRUt5HAeIVeE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
