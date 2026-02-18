@@ -104,6 +104,9 @@ const STATE_DOMAIN_MAP = {
 async function handleMessage(phone, message, messageType = 'text', selectedId = null, senderName = null) {
   let targetDomain = null;
   let previousState = null;
+  let cartDedupKey = null;
+  let orderDedupKey = null;
+  let ledger = null;
 
   try {
     // Get customer and state
@@ -115,7 +118,7 @@ async function handleMessage(phone, message, messageType = 'text', selectedId = 
     targetDomain = detectDomain(message, messageType, selectedId, state);
     const messageId = getMetadata('messageId') || null;
     const customerId = customer?._id ? String(customer._id) : null;
-    const ledger = getIdempotencyLedger();
+    ledger = getIdempotencyLedger();
     
     if (targetDomain && domainRegistry.hasDomain(targetDomain)) {
       setMetadata('targetDomain', targetDomain);
@@ -142,6 +145,7 @@ async function handleMessage(phone, message, messageType = 'text', selectedId = 
           action: cartAction,
           itemId: extractItemId(selectedId)
         });
+        cartDedupKey = cartKey;
         const cartGuard = await ledger.tryStart(cartKey, { metadata: { correlationId: getCorrelationId(), phone, messageId, selectedId } });
         if (cartGuard.status !== IDEMPOTENCY_STATUS.STARTED) {
           logger.info('Cart mutation deduplicated at router', {
@@ -160,6 +164,7 @@ async function handleMessage(phone, message, messageType = 'text', selectedId = 
     if (targetDomain === 'paymentInitiation' && customerId && messageId && (selectedId === 'checkout' || selectedId === 'pay_upi' || selectedId === 'pay_cod')) {
       const cartHash = stableHash(JSON.stringify(customer.cart || []));
       const orderKey = orderCreateKey({ customerId, messageId, cartHash });
+      orderDedupKey = orderKey;
       const orderGuard = await ledger.tryStart(orderKey, { metadata: { correlationId: getCorrelationId(), phone, messageId, selectedId } });
       if (orderGuard.status !== IDEMPOTENCY_STATUS.STARTED) {
         logger.info('Checkout/order trigger deduplicated at router', {
@@ -176,6 +181,25 @@ async function handleMessage(phone, message, messageType = 'text', selectedId = 
 
     // Fallback to legacy chatbot (Phase 3.6 will remove this)
     const result = await chatbot.handleMessage(phone, message, messageType, selectedId, senderName);
+
+    if (cartDedupKey) {
+      await ledger.markProcessed(cartDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        processedAt: new Date().toISOString()
+      });
+    }
+
+    if (orderDedupKey) {
+      await ledger.markProcessed(orderDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        processedAt: new Date().toISOString()
+      });
+    }
+
     const updatedCustomer = await Customer.findOne({ phone });
     const nextState = updatedCustomer ? conversationState.getState(updatedCustomer)?.currentStep || null : null;
     logger.info('Downstream chatbot handler completed', {
@@ -198,8 +222,48 @@ async function handleMessage(phone, message, messageType = 'text', selectedId = 
       correlationId: getCorrelationId()
     });
     
+
+    if (cartDedupKey) {
+      await ledger.markFailed(cartDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        failedAt: new Date().toISOString(),
+        error: error.message
+      });
+    }
+
+    if (orderDedupKey) {
+      await ledger.markFailed(orderDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        failedAt: new Date().toISOString(),
+        error: error.message
+      });
+    }
+
     // Fallback to legacy chatbot on error
     const result = await chatbot.handleMessage(phone, message, messageType, selectedId, senderName);
+
+    if (cartDedupKey) {
+      await ledger.markProcessed(cartDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        processedAt: new Date().toISOString()
+      });
+    }
+
+    if (orderDedupKey) {
+      await ledger.markProcessed(orderDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        processedAt: new Date().toISOString()
+      });
+    }
+
     const updatedCustomer = await Customer.findOne({ phone });
     const nextState = updatedCustomer ? conversationState.getState(updatedCustomer)?.currentStep || null : null;
     logger.info('Downstream chatbot handler completed', {

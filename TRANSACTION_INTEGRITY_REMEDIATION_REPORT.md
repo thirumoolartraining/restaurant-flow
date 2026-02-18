@@ -28,3 +28,12 @@
 ## Remaining Risk Notes
 - Some legacy deep chatbot cart/order mutation internals still rely on legacy save flows; duplicate prevention currently sits at router/queue boundaries.
 - Full per-notification ledger coverage across all non-payment event channels can be expanded in subsequent hardening.
+
+
+## Certification Tests Added (Phase 2.1)
+- `backend/__tests__/integrity/cartIdempotency.test.js`
+  - Validates duplicate cart add trigger with same `messageId` executes once and ledger key reaches `processed`.
+- `backend/__tests__/integrity/orderCreationIdempotency.test.js`
+  - Validates duplicate checkout trigger with same `messageId` creates one order and ledger key reaches `processed`.
+- Minimal required fix applied:
+  - router now marks cart/order trigger keys as `processed` on success and `failed` on error so certification assertions align with ledger contract.
