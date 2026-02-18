@@ -14,6 +14,8 @@ const {
   getPaymentWebhookIdempotencyStore,
   buildPaymentWebhookIdempotencyKey
 } = require('../services/paymentWebhookIdempotencyStore');
+const { getIdempotencyLedger, STATUS: IDEMPOTENCY_STATUS } = require('../services/idempotency/idempotencyLedger');
+const { paymentConfirmationKey, outboundNotificationKey } = require('../services/idempotency/idempotencyKey');
 const router = express.Router();
 
 // Create Razorpay order for UPI intent payment (no auth required - public endpoint)
@@ -218,6 +220,7 @@ router.post('/razorpay-webhook', webhookRateLimiter, express.raw({ type: 'applic
     const webhookId = event.id || req.headers['x-razorpay-event-id'] || null;
     const idempotencyKey = buildPaymentWebhookIdempotencyKey(event);
     const idempotencyStore = getPaymentWebhookIdempotencyStore();
+    const ledger = getIdempotencyLedger();
 
     const duplicateCheck = await idempotencyStore.checkAndMarkProcessing(idempotencyKey, {
       webhookId,
@@ -382,6 +385,18 @@ router.post('/razorpay-webhook', webhookRateLimiter, express.raw({ type: 'applic
     if (event.event === 'payment.captured') {
       const payment = payload.payment?.entity;
       const paymentLinkId = payment?.notes?.payment_link_id || payment?.payment_link_id;
+      const paymentIntegrityKey = paymentConfirmationKey({ orderId: paymentLinkId || 'unknown', paymentId: payment?.id, eventType });
+      const paymentGuard = await ledger.tryStart(paymentIntegrityKey, { metadata: { webhookId, paymentId: payment?.id, eventType } });
+      if (paymentGuard.status !== IDEMPOTENCY_STATUS.STARTED) {
+        logger.info('Payment confirmation deduplicated by business guard', {
+          webhookId,
+          paymentId: payment?.id,
+          eventType,
+          isDuplicate: true,
+          actionTaken: 'skip_payment_integrity_duplicate'
+        });
+        return res.json({ status: 'ok' });
+      }
       
       if (paymentLinkId) {
         const order = await Order.findOne({ razorpayOrderId: paymentLinkId });
@@ -429,6 +444,7 @@ router.post('/razorpay-webhook', webhookRateLimiter, express.raw({ type: 'applic
         }
       }
       
+      await ledger.markProcessed(paymentIntegrityKey, { webhookId, paymentId: payment?.id, eventType, orderId: paymentLinkId || null });
       await idempotencyStore.markProcessed(idempotencyKey, { webhookId, paymentId, eventType, isDuplicate: false, actionTaken: 'payment_captured_processed' });
       return res.json({ status: 'ok' });
     }

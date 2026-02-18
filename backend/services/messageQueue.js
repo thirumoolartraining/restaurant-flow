@@ -28,6 +28,8 @@ const {
   runWithContext,
   getCorrelationId
 } = require('./correlationContext');
+const { getIdempotencyLedger, STATUS: IDEMPOTENCY_STATUS } = require('./idempotency/idempotencyLedger');
+const { inboundMessageKey } = require('./idempotency/idempotencyKey');
 
 // Create Bull queue with Redis connection
 const messageQueue = new Bull('message-processing', {
@@ -145,6 +147,33 @@ messageQueue.process(async (job) => {
         queueMeta: job.data.webhookMeta || null
       });
 
+      const ledger = getIdempotencyLedger();
+      const messageKey = inboundMessageKey(messageId);
+      const startState = await ledger.tryStart(messageKey, {
+        metadata: { correlationId, messageId, phone, messageType },
+        ttlMs: 24 * 60 * 60 * 1000
+      });
+
+      if (startState.status === IDEMPOTENCY_STATUS.DUPLICATE_PROCESSED) {
+        logger.info('Duplicate processed message skipped in queue worker', {
+          messageId,
+          correlationId,
+          idempotencyKey: messageKey,
+          state: startState.status
+        });
+        return { success: true, duplicate: true, messageId, correlationId };
+      }
+
+      if (startState.status === IDEMPOTENCY_STATUS.IN_PROGRESS) {
+        logger.info('In-progress duplicate message skipped in queue worker', {
+          messageId,
+          correlationId,
+          idempotencyKey: messageKey,
+          state: startState.status
+        });
+        return { success: true, inProgress: true, messageId, correlationId };
+      }
+
       try {
         // Update job progress
         await job.progress(10);
@@ -155,6 +184,12 @@ messageQueue.process(async (job) => {
         // Update job progress
         await job.progress(100);
 
+        await ledger.markProcessed(messageKey, {
+          correlationId,
+          messageId,
+          completedAt: new Date().toISOString()
+        });
+
         logger.info('Message processed successfully from queue', {
           messageId,
           duration: Date.now() - job.timestamp,
@@ -164,6 +199,12 @@ messageQueue.process(async (job) => {
         return { success: true, messageId, correlationId };
 
       } catch (error) {
+        await ledger.markFailed(messageKey, {
+          correlationId,
+          messageId,
+          failedAt: new Date().toISOString(),
+          error: error.message
+        });
         logger.error('Message processing failed in queue', {
           messageId,
           correlationId,

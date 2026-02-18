@@ -18,8 +18,10 @@ jest.mock('../../services/googleSheets', () => ({ updateOrderStatus: jest.fn().m
 jest.mock('../../services/chatbotImages', () => ({ getImageUrl: jest.fn().mockResolvedValue(null) }));
 jest.mock('../../services/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn() }));
 jest.mock('../../services/eventEmitter', () => ({ emit: jest.fn() }));
-jest.mock('../../models/User', () => ({ find: jest.fn().mockResolvedValue([]) }));
-jest.mock('../../services/pushNotification', () => ({ sendNotification: jest.fn() }));
+const mockUserFind = jest.fn().mockResolvedValue([{ pushToken: 'token-1' }]);
+const mockSendNotification = jest.fn().mockResolvedValue(true);
+jest.mock('../../models/User', () => ({ find: (...args) => mockUserFind(...args) }));
+jest.mock('../../services/pushNotification', () => ({ sendNotification: (...args) => mockSendNotification(...args) }));
 
 const mockCheckAndMarkProcessing = jest.fn();
 const mockMarkProcessed = jest.fn().mockResolvedValue();
