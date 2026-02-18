@@ -21,7 +21,15 @@
 const Bull = require('bull');
 const { createClient } = require('./redis');
 const chatbotRouter = require('./chatbotRouter');
-const { logger, setMetadata } = require('./correlationContext');
+const {
+  logger,
+  setMetadata,
+  initContext,
+  runWithContext,
+  getCorrelationId
+} = require('./correlationContext');
+const { getIdempotencyLedger, STATUS: IDEMPOTENCY_STATUS } = require('./idempotency/idempotencyLedger');
+const { inboundMessageKey } = require('./idempotency/idempotencyKey');
 
 // Create Bull queue with Redis connection
 const messageQueue = new Bull('message-processing', {
@@ -62,17 +70,27 @@ const messageQueue = new Bull('message-processing', {
  */
 async function addMessage(messageData, priority = 5) {
   try {
+    const correlationId = messageData.correlationId || getCorrelationId();
+    const queueMeta = {
+      correlationId,
+      enqueuedAt: new Date().toISOString(),
+      source: messageData.webhookMeta?.source || 'webhook'
+    };
+
     const job = await messageQueue.add(messageData, {
       priority,
       jobId: messageData.messageId, // Use messageId as jobId for idempotency
       removeOnComplete: true, // Remove after successful processing
-      removeOnFail: false // Keep failed jobs for analysis
+      removeOnFail: false, // Keep failed jobs for analysis
+      stackTraceLimit: 10
     });
     
     logger.info('Message added to queue', {
       messageId: messageData.messageId,
       jobId: job.id,
-      priority
+      priority,
+      correlationId,
+      queueMeta
     });
     
     return job;
@@ -102,67 +120,122 @@ async function addMessage(messageData, priority = 5) {
  */
 messageQueue.process(async (job) => {
   const { messageId, phone, message, messageType, selectedId, senderName } = job.data;
-  
-  // Add metadata to correlation context
-  setMetadata('messageId', messageId);
-  setMetadata('phone', phone);
-  setMetadata('messageType', messageType);
-  setMetadata('jobId', job.id);
-  setMetadata('attempt', job.attemptsMade + 1);
-  
-  logger.info('Processing message from queue', {
-    messageId,
-    phone,
-    messageType,
-    attempt: job.attemptsMade + 1,
-    maxAttempts: job.opts.attempts
-  });
-  
-  try {
-    // Update job progress
-    await job.progress(10);
-    
-    // Route message through chatbot
-    await chatbotRouter.handleMessage(phone, message, messageType, selectedId, senderName);
-    
-    // Update job progress
-    await job.progress(100);
-    
-    logger.info('Message processed successfully from queue', {
+  const correlationId = job.data.correlationId || messageId;
+
+  return runWithContext(
+    initContext(correlationId, {
+      source: 'queue_worker',
+      jobId: String(job.id),
       messageId,
-      duration: Date.now() - job.timestamp
-    });
-    
-    return { success: true, messageId };
-    
-  } catch (error) {
-    logger.error('Message processing failed in queue', {
-      messageId,
-      error: error.message,
-      attempt: job.attemptsMade + 1,
-      willRetry: job.attemptsMade < job.opts.attempts - 1
-    });
-    
-    // Classify error for retry decision
-    const isRetryable = classifyError(error);
-    
-    if (!isRetryable) {
-      // Don't retry policy violations or business logic errors
-      logger.warn('Non-retryable error, moving to failed', {
+      phone
+    }),
+    async () => {
+      // Add metadata to correlation context
+      setMetadata('messageId', messageId);
+      setMetadata('phone', phone);
+      setMetadata('messageType', messageType);
+      setMetadata('jobId', String(job.id));
+      setMetadata('attempt', job.attemptsMade + 1);
+
+      logger.info('Processing message from queue', {
         messageId,
-        error: error.message
+        phone,
+        messageType,
+        attempt: job.attemptsMade + 1,
+        maxAttempts: job.opts.attempts,
+        correlationId,
+        queueMeta: job.data.webhookMeta || null
       });
-      
-      // Send user notification
-      await sendErrorNotification(phone, error, messageId);
-      
-      // Mark job as failed (no retry)
-      throw new Error(`NON_RETRYABLE: ${error.message}`);
+
+      const ledger = getIdempotencyLedger();
+      const messageKey = inboundMessageKey(messageId);
+      const startState = await ledger.tryStart(messageKey, {
+        metadata: { correlationId, messageId, phone, messageType },
+        ttlMs: 24 * 60 * 60 * 1000
+      });
+
+      if (startState.status === IDEMPOTENCY_STATUS.DUPLICATE_PROCESSED) {
+        logger.info('Duplicate processed message skipped in queue worker', {
+          messageId,
+          correlationId,
+          idempotencyKey: messageKey,
+          state: startState.status
+        });
+        return { success: true, duplicate: true, messageId, correlationId };
+      }
+
+      if (startState.status === IDEMPOTENCY_STATUS.IN_PROGRESS) {
+        logger.info('In-progress duplicate message skipped in queue worker', {
+          messageId,
+          correlationId,
+          idempotencyKey: messageKey,
+          state: startState.status
+        });
+        return { success: true, inProgress: true, messageId, correlationId };
+      }
+
+      try {
+        // Update job progress
+        await job.progress(10);
+
+        // Route message through chatbot
+        await chatbotRouter.handleMessage(phone, message, messageType, selectedId, senderName);
+
+        // Update job progress
+        await job.progress(100);
+
+        await ledger.markProcessed(messageKey, {
+          correlationId,
+          messageId,
+          completedAt: new Date().toISOString()
+        });
+
+        logger.info('Message processed successfully from queue', {
+          messageId,
+          duration: Date.now() - job.timestamp,
+          correlationId
+        });
+
+        return { success: true, messageId, correlationId };
+
+      } catch (error) {
+        await ledger.markFailed(messageKey, {
+          correlationId,
+          messageId,
+          failedAt: new Date().toISOString(),
+          error: error.message
+        });
+        logger.error('Message processing failed in queue', {
+          messageId,
+          correlationId,
+          error: error.message,
+          attempt: job.attemptsMade + 1,
+          willRetry: job.attemptsMade < job.opts.attempts - 1
+        });
+
+        // Classify error for retry decision
+        const isRetryable = classifyError(error);
+
+        if (!isRetryable) {
+          // Don't retry policy violations or business logic errors
+          logger.warn('Non-retryable error, moving to failed', {
+            messageId,
+            correlationId,
+            error: error.message
+          });
+
+          // Send user notification
+          await sendErrorNotification(phone, error, messageId);
+
+          // Mark job as failed (no retry)
+          throw new Error(`NON_RETRYABLE: ${error.message}`);
+        }
+
+        // Retryable error - let Bull handle retry
+        throw error;
+      }
     }
-    
-    // Retryable error - let Bull handle retry
-    throw error;
-  }
+  );
 });
 
 /**

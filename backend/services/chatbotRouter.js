@@ -17,7 +17,23 @@ const chatbot = require('./chatbot');
 const domainRegistry = require('./domains/index');
 const Customer = require('../models/Customer');
 const conversationState = require('./conversationState');
-const { logger } = require('./correlationContext');
+const { logger, getCorrelationId, setMetadata, getMetadata } = require('./correlationContext');
+const { getIdempotencyLedger, STATUS: IDEMPOTENCY_STATUS } = require('./idempotency/idempotencyLedger');
+const { cartMutationKey, orderCreateKey, stableHash } = require('./idempotency/idempotencyKey');
+
+
+function inferCartAction(selectedId = '', message = '') {
+  const text = String(message || '').toLowerCase();
+  if (selectedId.startsWith('add_') || /add/.test(text)) return 'add';
+  if (selectedId.startsWith('remove_') || /remove/.test(text)) return 'remove';
+  if (selectedId === 'clear_cart' || /clear cart|empty cart/.test(text)) return 'clear';
+  return null;
+}
+
+function extractItemId(selectedId = '') {
+  const match = String(selectedId).match(/(?:item_|add_|remove_)([a-zA-Z0-9]+)/);
+  return match ? match[1] : null;
+}
 
 // Intent to domain mapping
 const INTENT_DOMAIN_MAP = {
@@ -86,20 +102,32 @@ const STATE_DOMAIN_MAP = {
  * @returns {Promise<void>}
  */
 async function handleMessage(phone, message, messageType = 'text', selectedId = null, senderName = null) {
+  let targetDomain = null;
+  let previousState = null;
+  let cartDedupKey = null;
+  let orderDedupKey = null;
+  let ledger = null;
+
   try {
     // Get customer and state
     const customer = await Customer.findOne({ phone });
     const state = customer ? conversationState.getState(customer) : null;
+    previousState = state?.currentStep || null;
     
     // Determine target domain
-    const targetDomain = detectDomain(message, messageType, selectedId, state);
+    targetDomain = detectDomain(message, messageType, selectedId, state);
+    const messageId = getMetadata('messageId') || null;
+    const customerId = customer?._id ? String(customer._id) : null;
+    ledger = getIdempotencyLedger();
     
     if (targetDomain && domainRegistry.hasDomain(targetDomain)) {
+      setMetadata('targetDomain', targetDomain);
       logger.info('Routing to domain', {
         phone,
         domain: targetDomain,
         messageType,
-        selectedId
+        selectedId,
+        correlationId: getCorrelationId()
       });
       
       // Route to domain handler
@@ -108,18 +136,147 @@ async function handleMessage(phone, message, messageType = 'text', selectedId = 
       // Full domain routing will be implemented in Phase 3.6
     }
     
+    if (targetDomain === 'cart' && customerId && messageId) {
+      const cartAction = inferCartAction(selectedId, message);
+      if (cartAction) {
+        const cartKey = cartMutationKey({
+          customerId,
+          messageId,
+          action: cartAction,
+          itemId: extractItemId(selectedId)
+        });
+        cartDedupKey = cartKey;
+        const cartGuard = await ledger.tryStart(cartKey, { metadata: { correlationId: getCorrelationId(), phone, messageId, selectedId } });
+        if (cartGuard.status !== IDEMPOTENCY_STATUS.STARTED) {
+          logger.info('Cart mutation deduplicated at router', {
+            correlationId: getCorrelationId(),
+            messageId,
+            selectedId,
+            customerId,
+            key: cartKey,
+            state: cartGuard.status
+          });
+          return;
+        }
+      }
+    }
+
+    if (targetDomain === 'paymentInitiation' && customerId && messageId && (selectedId === 'checkout' || selectedId === 'pay_upi' || selectedId === 'pay_cod')) {
+      const cartHash = stableHash(JSON.stringify(customer.cart || []));
+      const orderKey = orderCreateKey({ customerId, messageId, cartHash });
+      orderDedupKey = orderKey;
+      const orderGuard = await ledger.tryStart(orderKey, { metadata: { correlationId: getCorrelationId(), phone, messageId, selectedId } });
+      if (orderGuard.status !== IDEMPOTENCY_STATUS.STARTED) {
+        logger.info('Checkout/order trigger deduplicated at router', {
+          correlationId: getCorrelationId(),
+          messageId,
+          selectedId,
+          customerId,
+          key: orderKey,
+          state: orderGuard.status
+        });
+        return;
+      }
+    }
+
     // Fallback to legacy chatbot (Phase 3.6 will remove this)
-    return await chatbot.handleMessage(phone, message, messageType, selectedId, senderName);
+    const result = await chatbot.handleMessage(phone, message, messageType, selectedId, senderName);
+
+    if (cartDedupKey) {
+      await ledger.markProcessed(cartDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        processedAt: new Date().toISOString()
+      });
+    }
+
+    if (orderDedupKey) {
+      await ledger.markProcessed(orderDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        processedAt: new Date().toISOString()
+      });
+    }
+
+    const updatedCustomer = await Customer.findOne({ phone });
+    const nextState = updatedCustomer ? conversationState.getState(updatedCustomer)?.currentStep || null : null;
+    logger.info('Downstream chatbot handler completed', {
+      phone,
+      messageType,
+      selectedId,
+      domain: targetDomain || 'legacy',
+      correlationId: getCorrelationId(),
+      messageId: getMetadata('messageId') || null,
+      previousState,
+      nextState
+    });
+    return result;
     
   } catch (error) {
     logger.error('Router error', {
       error: error.message,
       phone,
-      messageType
+      messageType,
+      correlationId: getCorrelationId()
     });
     
+
+    if (cartDedupKey) {
+      await ledger.markFailed(cartDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        failedAt: new Date().toISOString(),
+        error: error.message
+      });
+    }
+
+    if (orderDedupKey) {
+      await ledger.markFailed(orderDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        failedAt: new Date().toISOString(),
+        error: error.message
+      });
+    }
+
     // Fallback to legacy chatbot on error
-    return await chatbot.handleMessage(phone, message, messageType, selectedId, senderName);
+    const result = await chatbot.handleMessage(phone, message, messageType, selectedId, senderName);
+
+    if (cartDedupKey) {
+      await ledger.markProcessed(cartDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        processedAt: new Date().toISOString()
+      });
+    }
+
+    if (orderDedupKey) {
+      await ledger.markProcessed(orderDedupKey, {
+        correlationId: getCorrelationId(),
+        phone,
+        messageId: getMetadata('messageId') || null,
+        processedAt: new Date().toISOString()
+      });
+    }
+
+    const updatedCustomer = await Customer.findOne({ phone });
+    const nextState = updatedCustomer ? conversationState.getState(updatedCustomer)?.currentStep || null : null;
+    logger.info('Downstream chatbot handler completed', {
+      phone,
+      messageType,
+      selectedId,
+      domain: targetDomain || 'legacy',
+      correlationId: getCorrelationId(),
+      messageId: getMetadata('messageId') || null,
+      previousState,
+      nextState
+    });
+    return result;
   }
 }
 

@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const logger = require('../services/logger');
 const chatbot = require('../services/chatbot');
 const whatsapp = require('../services/whatsapp');
@@ -6,9 +7,34 @@ const googleSheets = require('../services/googleSheets');
 const metaCloud = require('../services/metaCloud');
 const groqAi = require('../services/groqAi');
 const pushNotification = require('../services/pushNotification');
+const messageQueue = require('../services/messageQueue');
+const {
+  initContext,
+  runWithContext,
+  logger: correlationLogger,
+  getCorrelationId,
+  setMetadata
+} = require('../services/correlationContext');
 const authMiddleware = require('../middleware/auth');
 const { webhookRateLimiter } = require('../middleware/rateLimiter');
 const router = express.Router();
+
+function generateFallbackId(prefix = 'webhook') {
+  if (typeof crypto.randomUUID === 'function') {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+}
+
+function getWebhookCorrelationId(entry, change, message) {
+  return (
+    message?.id ||
+    change?.value?.statuses?.[0]?.id ||
+    change?.value?.metadata?.phone_number_id ||
+    entry?.id ||
+    generateFallbackId('meta')
+  );
+}
 
 // ============================================================
 // TEST/DEBUG ROUTES - Protected with auth, disabled in production
@@ -354,9 +380,70 @@ router.post('/meta', webhookRateLimiter, async (req, res) => {
 
               const hasContent = text || selectedId || messageType === 'location';
               if (phone && hasContent) {
-                // Process message in the background
-                chatbot.handleMessage(phone, text, messageType, selectedId, senderName)
-                  .catch(err => logger.error('❌ Async Chatbot Error:', err));
+                const correlationId = getWebhookCorrelationId(entry, change, message);
+
+                runWithContext(
+                  initContext(correlationId, {
+                    source: 'meta_webhook',
+                    messageId: message.id || null,
+                    entryId: entry.id || null,
+                    changeField: change.field
+                  }),
+                  async () => {
+                    try {
+                      setMetadata('phone', phone);
+                      setMetadata('messageType', messageType);
+                      setMetadata('selectedId', selectedId);
+
+                      const queuePayload = {
+                        messageId: message.id || generateFallbackId('msg'),
+                        phone,
+                        message: text,
+                        messageType,
+                        selectedId,
+                        senderName,
+                        correlationId,
+                        webhookMeta: {
+                          source: 'meta_webhook',
+                          entryId: entry.id || null,
+                          changeField: change.field,
+                          valueTimestamp: value.timestamp || null
+                        }
+                      };
+
+                      correlationLogger.info('Webhook message parsed', {
+                        phone,
+                        messageType,
+                        selectedId,
+                        messageId: queuePayload.messageId,
+                        correlationId: getCorrelationId()
+                      });
+
+                      await messageQueue.addMessage(queuePayload);
+
+                      correlationLogger.info('Webhook message enqueued', {
+                        messageId: queuePayload.messageId,
+                        correlationId: getCorrelationId()
+                      });
+                    } catch (err) {
+                      logger.error('❌ Async webhook queue error', {
+                        error: err.message,
+                        correlationId,
+                        phone,
+                        fallback: 'direct_chatbot'
+                      });
+
+                      // Backward-compatible fallback
+                      chatbot.handleMessage(phone, text, messageType, selectedId, senderName)
+                        .catch(fallbackErr => logger.error('❌ Async Chatbot Error:', fallbackErr));
+                    }
+                  }
+                ).catch(err => {
+                  logger.error('❌ Correlation context execution error', {
+                    error: err.message,
+                    correlationId
+                  });
+                });
               }
             }
           }
